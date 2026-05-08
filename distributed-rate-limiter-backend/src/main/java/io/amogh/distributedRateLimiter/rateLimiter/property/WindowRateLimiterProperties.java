@@ -6,9 +6,9 @@ import org.springframework.stereotype.Component;
 import lombok.Data;
 
 @Component
-@ConfigurationProperties(prefix = "rate-limiter.fixed-window")
+@ConfigurationProperties(prefix = "rate-limiter.window")
 @Data
-public class FixedWindowRateLimiterProperties {
+public class WindowRateLimiterProperties {
     
     private int limit;
     private int window;
