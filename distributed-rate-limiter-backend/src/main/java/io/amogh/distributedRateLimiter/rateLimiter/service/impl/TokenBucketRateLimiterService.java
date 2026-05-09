@@ -1,23 +1,22 @@
 package io.amogh.distributedRateLimiter.rateLimiter.service.impl;
 
-import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
-import java.util.Objects;
 
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.data.redis.core.ReactiveRedisTemplate;
+import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Service;
 
 import io.amogh.distributedRateLimiter.rateLimiter.property.BucketRateLimiterProperties;
 import io.amogh.distributedRateLimiter.rateLimiter.service.IRateLimiterService;
 import lombok.RequiredArgsConstructor;
+import reactor.core.publisher.Mono;
 
 @Service("token-bucket")
 @RequiredArgsConstructor
 public class TokenBucketRateLimiterService implements IRateLimiterService {
 
-    private final StringRedisTemplate redisTemplate;
+    private final ReactiveRedisTemplate<String, String> redisTemplate;
     private final BucketRateLimiterProperties properties;
 
     private static final String LUA_SCRIPT = """
@@ -37,12 +36,12 @@ public class TokenBucketRateLimiterService implements IRateLimiterService {
         """;
 
     @Override
-    public boolean tryConsume(String userId) {
-        return tryConsumeAndGetRemaining(userId) >= 0;
+    public Mono<Boolean> tryConsume(String userId) {
+        return tryConsumeAndGetRemaining(userId).map(result -> result >= 0);
     }
 
     @Override
-    public int getRemaining(String userId) {
+    public Mono<Integer> getRemaining(String userId) {
         String userTokenKey = REDIS_KEY_PREFIX + "tb:tokens:" + userId;
         String userRefillKey = REDIS_KEY_PREFIX + "tb:last-refill:" + userId;
 
@@ -51,22 +50,29 @@ public class TokenBucketRateLimiterService implements IRateLimiterService {
         long refillRate = properties.getRefillAmount();
         long refillInterval = properties.getRefillRate();
 
-        String currentVal = redisTemplate.opsForValue().get(userTokenKey);
-        long currentCount = Objects.nonNull(currentVal) ? Long.parseLong(currentVal) : capacity;
+        Mono<String> tokenMono = redisTemplate.opsForValue().get(userTokenKey);
+        Mono<String> refillMono = redisTemplate.opsForValue().get(userRefillKey);
 
-        String refillVal = redisTemplate.opsForValue().get(userRefillKey);
-        long lastRefill = Objects.nonNull(refillVal) ? Long.parseLong(refillVal) : now;
+        return Mono.zip(tokenMono, refillMono)
+                .map(tuple -> {
+                    String currentVal = tuple.getT1();
+                    String refillVal = tuple.getT2();
 
-        long elapsed = now - lastRefill;
-        if (elapsed < 0) elapsed = 0;
-        long tokenToAdd = (refillRate * elapsed) / refillInterval;
-        currentCount = Math.min(capacity, currentCount + tokenToAdd);
+                    long currentCount = currentVal != null ? Long.parseLong(currentVal) : capacity;
+                    long lastRefill = refillVal != null ? Long.parseLong(refillVal) : now;
 
-        return (int) Math.max(0, currentCount);
+                    long elapsed = now - lastRefill;
+                    if (elapsed < 0) elapsed = 0;
+                    long tokenToAdd = (refillRate * elapsed) / refillInterval;
+                    currentCount = Math.min(capacity, currentCount + tokenToAdd);
+
+                    return (int) Math.max(0, currentCount);
+                })
+                .switchIfEmpty(Mono.just((int) capacity));
     }
 
     @Override
-    public int tryConsumeAndGetRemaining(String userId) {
+    public Mono<Integer> tryConsumeAndGetRemaining(String userId) {
         String userTokenKey = REDIS_KEY_PREFIX + "tb:tokens:" + userId;
         String userRefillKey = REDIS_KEY_PREFIX + "tb:last-refill:" + userId;
 
@@ -76,18 +82,20 @@ public class TokenBucketRateLimiterService implements IRateLimiterService {
         long refillInterval = properties.getRefillRate();
         long ttl = refillInterval * 2;
 
-        DefaultRedisScript<Long> script = new DefaultRedisScript<>(LUA_SCRIPT, Long.class);
-        Long result = redisTemplate.execute(
-                script,
-                List.of(userTokenKey, userRefillKey),
-                String.valueOf(now),
-                String.valueOf(capacity),
-                String.valueOf(refillRate),
-                String.valueOf(refillInterval),
-                String.valueOf(ttl)
-        );
+        RedisScript<Long> script = RedisScript.of(LUA_SCRIPT, Long.class);
 
-        return result != null ? result.intValue() : -1;
+        return redisTemplate.execute(
+                        script,
+                        List.of(userTokenKey, userRefillKey),
+                        String.valueOf(now),
+                        String.valueOf(capacity),
+                        String.valueOf(refillRate),
+                        String.valueOf(refillInterval),
+                        String.valueOf(ttl)
+                )
+                .next()
+                .map(Long::intValue)
+                .defaultIfEmpty(-1);
     }
 
 }

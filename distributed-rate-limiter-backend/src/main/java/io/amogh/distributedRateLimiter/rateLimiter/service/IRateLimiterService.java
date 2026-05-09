@@ -1,11 +1,13 @@
 package io.amogh.distributedRateLimiter.rateLimiter.service;
 
+import reactor.core.publisher.Mono;
+
 public interface IRateLimiterService {
 
     String REDIS_KEY_PREFIX = "rate-limiter:";
 
-    boolean tryConsume(String userId);
-    int getRemaining(String userId);
-    int tryConsumeAndGetRemaining(String userId);
+    Mono<Boolean> tryConsume(String userId);
+    Mono<Integer> getRemaining(String userId);
+    Mono<Integer> tryConsumeAndGetRemaining(String userId);
 
 }

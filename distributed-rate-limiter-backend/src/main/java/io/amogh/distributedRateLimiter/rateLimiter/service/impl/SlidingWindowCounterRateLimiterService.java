@@ -3,21 +3,21 @@ package io.amogh.distributedRateLimiter.rateLimiter.service.impl;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
-import java.util.Objects;
 
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.data.redis.core.ReactiveRedisTemplate;
+import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Service;
 
 import io.amogh.distributedRateLimiter.rateLimiter.property.WindowRateLimiterProperties;
 import io.amogh.distributedRateLimiter.rateLimiter.service.IRateLimiterService;
 import lombok.RequiredArgsConstructor;
+import reactor.core.publisher.Mono;
 
 @Service("sliding-window-counter")
 @RequiredArgsConstructor
 public class SlidingWindowCounterRateLimiterService implements IRateLimiterService {
 
-    private final StringRedisTemplate redisTemplate;
+    private final ReactiveRedisTemplate<String, String> redisTemplate;
     private final WindowRateLimiterProperties properties;
 
     private static final String LUA_SCRIPT = """
@@ -35,12 +35,12 @@ public class SlidingWindowCounterRateLimiterService implements IRateLimiterServi
         """;
 
     @Override
-    public boolean tryConsume(String userId) {
-        return tryConsumeAndGetRemaining(userId) >= 0;
+    public Mono<Boolean> tryConsume(String userId) {
+        return tryConsumeAndGetRemaining(userId).map(result -> result >= 0);
     }
 
     @Override
-    public int getRemaining(String userId) {
+    public Mono<Integer> getRemaining(String userId) {
         String userKey = REDIS_KEY_PREFIX + "sw-counter:" + userId;
         long now = Instant.now().getEpochSecond();
         int windowSize = properties.getWindow();
@@ -52,20 +52,27 @@ public class SlidingWindowCounterRateLimiterService implements IRateLimiterServi
         String currentWindowKey = userKey + ":" + currentWindowStart;
         String previousWindowKey = userKey + ":" + previousWindowStart;
 
-        String currentVal = redisTemplate.opsForValue().get(currentWindowKey);
-        long currentCount = Objects.nonNull(currentVal) ? Long.parseLong(currentVal) : 0;
+        Mono<String> currentMono = redisTemplate.opsForValue().get(currentWindowKey);
+        Mono<String> previousMono = redisTemplate.opsForValue().get(previousWindowKey);
 
-        String prevVal = redisTemplate.opsForValue().get(previousWindowKey);
-        long previousCount = Objects.nonNull(prevVal) ? Long.parseLong(prevVal) : 0;
+        return Mono.zip(currentMono, previousMono)
+                .map(tuple -> {
+                    String currentVal = tuple.getT1();
+                    String prevVal = tuple.getT2();
 
-        long previousWindowTimeRemaining = currentWindowStart + windowSize - now;
-        long count = currentCount + (previousCount * previousWindowTimeRemaining) / windowSize;
+                    long currentCount = currentVal != null ? Long.parseLong(currentVal) : 0;
+                    long previousCount = prevVal != null ? Long.parseLong(prevVal) : 0;
 
-        return (int) Math.max(0, limit - count);
+                    long previousWindowTimeRemaining = currentWindowStart + windowSize - now;
+                    long count = currentCount + (previousCount * previousWindowTimeRemaining) / windowSize;
+
+                    return (int) Math.max(0, limit - count);
+                })
+                .switchIfEmpty(Mono.just(limit));
     }
 
     @Override
-    public int tryConsumeAndGetRemaining(String userId) {
+    public Mono<Integer> tryConsumeAndGetRemaining(String userId) {
         String userKey = REDIS_KEY_PREFIX + "sw-counter:" + userId;
         long now = Instant.now().getEpochSecond();
         int windowSize = properties.getWindow();
@@ -77,17 +84,19 @@ public class SlidingWindowCounterRateLimiterService implements IRateLimiterServi
         String currentWindowKey = userKey + ":" + currentWindowStart;
         String previousWindowKey = userKey + ":" + previousWindowStart;
 
-        DefaultRedisScript<Long> script = new DefaultRedisScript<>(LUA_SCRIPT, Long.class);
-        Long result = redisTemplate.execute(
-                script,
-                List.of(currentWindowKey, previousWindowKey),
-                String.valueOf(now),
-                String.valueOf(windowSize),
-                String.valueOf(limit),
-                String.valueOf(windowSize * 2)
-        );
+        RedisScript<Long> script = RedisScript.of(LUA_SCRIPT, Long.class);
 
-        return result != null ? result.intValue() : -1;
+        return redisTemplate.execute(
+                        script,
+                        List.of(currentWindowKey, previousWindowKey),
+                        String.valueOf(now),
+                        String.valueOf(windowSize),
+                        String.valueOf(limit),
+                        String.valueOf(windowSize * 2)
+                )
+                .next()
+                .map(Long::intValue)
+                .defaultIfEmpty(-1);
     }
 
 }

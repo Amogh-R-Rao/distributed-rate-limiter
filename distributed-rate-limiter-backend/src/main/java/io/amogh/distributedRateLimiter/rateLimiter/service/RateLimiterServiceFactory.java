@@ -1,9 +1,10 @@
 package io.amogh.distributedRateLimiter.rateLimiter.service;
 
+import java.util.Map;
+
 import org.springframework.stereotype.Component;
 
-import java.util.Map;
-import java.util.Objects;
+import reactor.core.publisher.Mono;
 
 @Component
 public class RateLimiterServiceFactory {
@@ -14,12 +15,12 @@ public class RateLimiterServiceFactory {
         this.services = services;
     }
 
-    public IRateLimiterService getService(String type) {
-        IRateLimiterService  service = services.get(type);
-        if(Objects.isNull(service)) {
-            throw new IllegalArgumentException("Unsupported Service Type");
+    public Mono<IRateLimiterService> getService(String type) {
+        IRateLimiterService service = services.get(type);
+        if (service == null) {
+            return Mono.error(new IllegalArgumentException("Unsupported Service Type"));
         }
-        return service;
+        return Mono.just(service);
     }
 
 }

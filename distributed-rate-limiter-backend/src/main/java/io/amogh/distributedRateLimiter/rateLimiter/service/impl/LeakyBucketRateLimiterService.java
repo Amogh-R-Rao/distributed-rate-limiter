@@ -3,21 +3,21 @@ package io.amogh.distributedRateLimiter.rateLimiter.service.impl;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
-import java.util.Objects;
 
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.data.redis.core.ReactiveRedisTemplate;
+import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Service;
 
 import io.amogh.distributedRateLimiter.rateLimiter.property.BucketRateLimiterProperties;
 import io.amogh.distributedRateLimiter.rateLimiter.service.IRateLimiterService;
 import lombok.RequiredArgsConstructor;
+import reactor.core.publisher.Mono;
 
 @Service("leaky-bucket")
 @RequiredArgsConstructor
 public class LeakyBucketRateLimiterService implements IRateLimiterService {
 
-    private final StringRedisTemplate redisTemplate;
+    private final ReactiveRedisTemplate<String, String> redisTemplate;
     private final BucketRateLimiterProperties properties;
 
     private static final String LUA_SCRIPT = """
@@ -39,54 +39,55 @@ public class LeakyBucketRateLimiterService implements IRateLimiterService {
         """;
 
     @Override
-    public boolean tryConsume(String userId) {
-        return tryConsumeAndGetRemaining(userId) >= 0;
+    public Mono<Boolean> tryConsume(String userId) {
+        return tryConsumeAndGetRemaining(userId).map(result -> result >= 0);
     }
 
     @Override
-    public int getRemaining(String userId) {
+    public Mono<Integer> getRemaining(String userId) {
         String queueKey = REDIS_KEY_PREFIX + "lb:queue:" + userId;
         long capacity = properties.getMaxTokens();
         long interval = properties.getRefillRate();
-
         long now = Instant.now().getEpochSecond();
 
-        String oldestTsVal = redisTemplate.opsForList().index(queueKey, 0);
-        if (Objects.nonNull(oldestTsVal)) {
-            long oldestTs = Long.parseLong(oldestTsVal);
-            long elapsed = now - oldestTs;
-            long shouldLeak = elapsed / interval;
+        return redisTemplate.opsForList().index(queueKey, 0)
+                .flatMap(oldestTsVal -> {
+                    long oldestTs = Long.parseLong(oldestTsVal);
+                    long elapsed = now - oldestTs;
+                    long shouldLeak = elapsed / interval;
 
-            if (shouldLeak > 0) {
-                redisTemplate.opsForList().leftPop(queueKey, shouldLeak);
-            }
-        }
-
-        Long queueSize = redisTemplate.opsForList().size(queueKey);
-        long actualSize = Objects.nonNull(queueSize) ? queueSize : 0;
-
-        return (int) Math.max(0, capacity - actualSize);
+                    if (shouldLeak > 0) {
+                        return redisTemplate.opsForList().leftPop(queueKey, shouldLeak)
+                                .then(redisTemplate.opsForList().size(queueKey));
+                    }
+                    return redisTemplate.opsForList().size(queueKey);
+                })
+                .switchIfEmpty(redisTemplate.opsForList().size(queueKey))
+                .map(size -> (int) Math.max(0, capacity - size))
+                .defaultIfEmpty((int) capacity);
     }
 
     @Override
-    public int tryConsumeAndGetRemaining(String userId) {
+    public Mono<Integer> tryConsumeAndGetRemaining(String userId) {
         String queueKey = REDIS_KEY_PREFIX + "lb:queue:" + userId;
         long capacity = properties.getMaxTokens();
         long interval = properties.getRefillRate();
         long now = Instant.now().getEpochSecond();
         Duration ttl = Duration.ofSeconds(interval).multipliedBy(capacity).multipliedBy(2);
 
-        DefaultRedisScript<Long> script = new DefaultRedisScript<>(LUA_SCRIPT, Long.class);
-        Long result = redisTemplate.execute(
-                script,
-                List.of(queueKey),
-                String.valueOf(now),
-                String.valueOf(capacity),
-                String.valueOf(interval),
-                String.valueOf(ttl.getSeconds())
-        );
+        RedisScript<Long> script = RedisScript.of(LUA_SCRIPT, Long.class);
 
-        return result != null ? result.intValue() : -1;
+        return redisTemplate.execute(
+                        script,
+                        List.of(queueKey),
+                        String.valueOf(now),
+                        String.valueOf(capacity),
+                        String.valueOf(interval),
+                        String.valueOf(ttl.getSeconds())
+                )
+                .next()
+                .map(Long::intValue)
+                .defaultIfEmpty(-1);
     }
 
 }

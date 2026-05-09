@@ -3,22 +3,23 @@ package io.amogh.distributedRateLimiter.rateLimiter.service.impl;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
-import java.util.Objects;
 import java.util.UUID;
 
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.data.domain.Range;
+import org.springframework.data.redis.core.ReactiveRedisTemplate;
+import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Service;
 
 import io.amogh.distributedRateLimiter.rateLimiter.property.WindowRateLimiterProperties;
 import io.amogh.distributedRateLimiter.rateLimiter.service.IRateLimiterService;
 import lombok.RequiredArgsConstructor;
+import reactor.core.publisher.Mono;
 
 @Service("sliding-window-log")
 @RequiredArgsConstructor
 public class SlidingWindowLogRateLimiterService implements IRateLimiterService {
 
-    private final StringRedisTemplate redisTemplate;
+    private final ReactiveRedisTemplate<String, String> redisTemplate;
     private final WindowRateLimiterProperties properties;
 
     private static final String LUA_SCRIPT = """
@@ -33,44 +34,45 @@ public class SlidingWindowLogRateLimiterService implements IRateLimiterService {
         """;
 
     @Override
-    public boolean tryConsume(String userId) {
-        return tryConsumeAndGetRemaining(userId) >= 0;
+    public Mono<Boolean> tryConsume(String userId) {
+        return tryConsumeAndGetRemaining(userId).map(result -> result >= 0);
     }
 
     @Override
-    public int getRemaining(String userId) {
+    public Mono<Integer> getRemaining(String userId) {
         String userKey = REDIS_KEY_PREFIX + "sliding-window:" + userId;
         long now = Instant.now().getEpochSecond();
         double window = now - properties.getWindow();
 
-        redisTemplate.opsForZSet().removeRangeByScore(userKey, 0, window);
-
-        Long currentCount = redisTemplate.opsForZSet().size(userKey);
-        long actualCount = Objects.nonNull(currentCount) ? currentCount : 0;
-
-        return (int) Math.max(0, properties.getLimit() - actualCount);
+        return redisTemplate.opsForZSet().removeRangeByScore(userKey, Range.closed(0.0, window))
+                .flatMap(removed -> redisTemplate.opsForZSet().size(userKey))
+                .switchIfEmpty(redisTemplate.opsForZSet().size(userKey))
+                .map(count -> (int) Math.max(0, properties.getLimit() - count))
+                .defaultIfEmpty(properties.getLimit());
     }
 
     @Override
-    public int tryConsumeAndGetRemaining(String userId) {
+    public Mono<Integer> tryConsumeAndGetRemaining(String userId) {
         String userKey = REDIS_KEY_PREFIX + "sliding-window:" + userId;
         long now = Instant.now().getEpochSecond();
         double windowStart = now - properties.getWindow();
         Duration duration = Duration.ofSeconds(properties.getWindow());
         String requestId = UUID.randomUUID().toString();
 
-        DefaultRedisScript<Long> script = new DefaultRedisScript<>(LUA_SCRIPT, Long.class);
-        Long result = redisTemplate.execute(
-                script,
-                List.of(userKey),
-                String.valueOf(now),
-                String.valueOf(windowStart),
-                String.valueOf(properties.getLimit()),
-                String.valueOf(duration.getSeconds()),
-                requestId
-        );
+        RedisScript<Long> script = RedisScript.of(LUA_SCRIPT, Long.class);
 
-        return result != null ? result.intValue() : -1;
+        return redisTemplate.execute(
+                        script,
+                        List.of(userKey),
+                        String.valueOf(now),
+                        String.valueOf(windowStart),
+                        String.valueOf(properties.getLimit()),
+                        String.valueOf(duration.getSeconds()),
+                        requestId
+                )
+                .next()
+                .map(Long::intValue)
+                .defaultIfEmpty(-1);
     }
 
 }
