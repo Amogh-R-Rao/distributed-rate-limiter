@@ -2,9 +2,11 @@ package io.amogh.distributedRateLimiter.rateLimiter.service.impl;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 import java.util.Objects;
 
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 
 import io.amogh.distributedRateLimiter.rateLimiter.property.WindowRateLimiterProperties;
@@ -17,6 +19,20 @@ public class SlidingWindowCounterRateLimiterService implements IRateLimiterServi
 
     private final StringRedisTemplate redisTemplate;
     private final WindowRateLimiterProperties properties;
+
+    private static final String LUA_SCRIPT = """
+        local currentCount = tonumber(redis.call('GET', KEYS[1]) or '0')
+        local previousCount = tonumber(redis.call('GET', KEYS[2]) or '0')
+        redis.call('EXPIRE', KEYS[1], ARGV[4])
+        local elapsedInWindow = ARGV[1] % ARGV[2]
+        local weightedPrev = (previousCount * (ARGV[2] - elapsedInWindow)) / ARGV[2]
+        local count = currentCount + weightedPrev
+        if count >= tonumber(ARGV[3]) then
+            return -1
+        end
+        redis.call('INCR', KEYS[1])
+        return tonumber(ARGV[3]) - math.floor(count) - 1
+        """;
 
     @Override
     public boolean tryConsume(String userId) {
@@ -61,24 +77,17 @@ public class SlidingWindowCounterRateLimiterService implements IRateLimiterServi
         String currentWindowKey = userKey + ":" + currentWindowStart;
         String previousWindowKey = userKey + ":" + previousWindowStart;
 
-        String currentVal = redisTemplate.opsForValue().get(currentWindowKey);
-        long currentCount = Objects.nonNull(currentVal) ? Long.parseLong(currentVal) : 0;
+        DefaultRedisScript<Long> script = new DefaultRedisScript<>(LUA_SCRIPT, Long.class);
+        Long result = redisTemplate.execute(
+                script,
+                List.of(currentWindowKey, previousWindowKey),
+                String.valueOf(now),
+                String.valueOf(windowSize),
+                String.valueOf(limit),
+                String.valueOf(windowSize * 2)
+        );
 
-        String prevVal = redisTemplate.opsForValue().get(previousWindowKey);
-        long previousCount = Objects.nonNull(prevVal) ? Long.parseLong(prevVal) : 0;
-
-        redisTemplate.expire(currentWindowKey, Duration.ofSeconds(windowSize * 2));
-
-        long previousWindowTimeRemaining = currentWindowStart + windowSize - now;
-        long count = currentCount + (previousCount * previousWindowTimeRemaining) / windowSize;
-
-        if (count >= limit) {
-            return -1;
-        }
-
-        redisTemplate.opsForValue().increment(currentWindowKey);
-
-        return (int) (limit - count - 1);
+        return result != null ? result.intValue() : -1;
     }
 
 }

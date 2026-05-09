@@ -2,9 +2,11 @@ package io.amogh.distributedRateLimiter.rateLimiter.service.impl;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 import java.util.Objects;
 
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 
 import io.amogh.distributedRateLimiter.rateLimiter.property.BucketRateLimiterProperties;
@@ -17,6 +19,22 @@ public class TokenBucketRateLimiterService implements IRateLimiterService {
 
     private final StringRedisTemplate redisTemplate;
     private final BucketRateLimiterProperties properties;
+
+    private static final String LUA_SCRIPT = """
+        local tokens = tonumber(redis.call('GET', KEYS[1]) or ARGV[2])
+        local lastRefill = tonumber(redis.call('GET', KEYS[2]) or ARGV[1])
+        local elapsed = ARGV[1] - lastRefill
+        if elapsed < 0 then elapsed = 0 end
+        local toAdd = (ARGV[3] * elapsed) / ARGV[4]
+        tokens = math.min(ARGV[2], tokens + toAdd)
+        if tokens >= 1 then
+            tokens = tokens - 1
+            redis.call('SET', KEYS[1], tokens, 'EX', ARGV[5])
+            redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[5])
+            return math.floor(tokens)
+        end
+        return -1
+        """;
 
     @Override
     public boolean tryConsume(String userId) {
@@ -58,25 +76,18 @@ public class TokenBucketRateLimiterService implements IRateLimiterService {
         long refillInterval = properties.getRefillRate();
         long ttl = refillInterval * 2;
 
-        String currentVal = redisTemplate.opsForValue().get(userTokenKey);
-        long currentCount = Objects.nonNull(currentVal) ? Long.parseLong(currentVal) : capacity;
+        DefaultRedisScript<Long> script = new DefaultRedisScript<>(LUA_SCRIPT, Long.class);
+        Long result = redisTemplate.execute(
+                script,
+                List.of(userTokenKey, userRefillKey),
+                String.valueOf(now),
+                String.valueOf(capacity),
+                String.valueOf(refillRate),
+                String.valueOf(refillInterval),
+                String.valueOf(ttl)
+        );
 
-        String refillVal = redisTemplate.opsForValue().get(userRefillKey);
-        long lastRefill = Objects.nonNull(refillVal) ? Long.parseLong(refillVal) : now;
-
-        long elapsed = now - lastRefill;
-        if (elapsed < 0) elapsed = 0;
-        long tokenToAdd = (refillRate * elapsed) / refillInterval;
-        currentCount = Math.min(capacity, currentCount + tokenToAdd);
-
-        if (currentCount >= 1) {
-            currentCount--;
-            redisTemplate.opsForValue().set(userTokenKey, String.valueOf(currentCount), Duration.ofSeconds(ttl));
-            redisTemplate.opsForValue().set(userRefillKey, String.valueOf(now), Duration.ofSeconds(ttl));
-            return (int) currentCount;
-        }
-
-        return -1;
+        return result != null ? result.intValue() : -1;
     }
 
 }
