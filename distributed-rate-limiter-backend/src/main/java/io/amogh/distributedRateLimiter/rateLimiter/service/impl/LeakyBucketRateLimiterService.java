@@ -20,6 +20,36 @@ public class LeakyBucketRateLimiterService implements IRateLimiterService {
 
     @Override
     public boolean tryConsume(String userId) {
+        return tryConsumeAndGetRemaining(userId) >= 0;
+    }
+
+    @Override
+    public int getRemaining(String userId) {
+        String queueKey = REDIS_KEY_PREFIX + "lb:queue:" + userId;
+        long capacity = properties.getMaxTokens();
+        long interval = properties.getRefillRate();
+
+        long now = Instant.now().getEpochSecond();
+
+        String oldestTsVal = redisTemplate.opsForList().index(queueKey, 0);
+        if (Objects.nonNull(oldestTsVal)) {
+            long oldestTs = Long.parseLong(oldestTsVal);
+            long elapsed = now - oldestTs;
+            long shouldLeak = elapsed / interval;
+
+            if (shouldLeak > 0) {
+                redisTemplate.opsForList().leftPop(queueKey, shouldLeak);
+            }
+        }
+
+        Long queueSize = redisTemplate.opsForList().size(queueKey);
+        long actualSize = Objects.nonNull(queueSize) ? queueSize : 0;
+
+        return (int) Math.max(0, capacity - actualSize);
+    }
+
+    @Override
+    public int tryConsumeAndGetRemaining(String userId) {
         String queueKey = REDIS_KEY_PREFIX + "lb:queue:" + userId;
         long capacity = properties.getMaxTokens();
         long interval = properties.getRefillRate();
@@ -41,7 +71,7 @@ public class LeakyBucketRateLimiterService implements IRateLimiterService {
         long actualSize = Objects.nonNull(queueSize) ? queueSize : 0;
 
         if (actualSize >= capacity) {
-            return false;
+            return -1;
         }
 
         redisTemplate.opsForList().rightPush(queueKey, String.valueOf(now));
@@ -49,19 +79,7 @@ public class LeakyBucketRateLimiterService implements IRateLimiterService {
         Duration ttl = Duration.ofSeconds(interval).multipliedBy(capacity).multipliedBy(2);
         redisTemplate.expire(queueKey, ttl);
 
-        return true;
+        return (int) (capacity - actualSize - 1);
     }
 
-    @Override
-    public int getRemaining(String userId) {
-        // TODO Auto-generated method stub
-        throw new UnsupportedOperationException("Unimplemented method 'getRemaining'");
-    }
-
-    @Override
-    public int tryConsumeAndGetRemaining(String userId) {
-        // TODO Auto-generated method stub
-        throw new UnsupportedOperationException("Unimplemented method 'tryConsumeAndGetRemaining'");
-    }
-    
 }
