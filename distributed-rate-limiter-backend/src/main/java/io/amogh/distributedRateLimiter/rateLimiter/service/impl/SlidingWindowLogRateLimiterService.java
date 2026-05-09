@@ -13,9 +13,9 @@ import io.amogh.distributedRateLimiter.rateLimiter.property.WindowRateLimiterPro
 import io.amogh.distributedRateLimiter.rateLimiter.service.IRateLimiterService;
 import lombok.RequiredArgsConstructor;
 
-@Service("sliding-window")
+@Service("sliding-window-log")
 @RequiredArgsConstructor
-public class SlidingWindowRateLimiterService  implements IRateLimiterService {
+public class SlidingWindowLogRateLimiterService implements IRateLimiterService {
     
     private final StringRedisTemplate redisTemplate;
     private final WindowRateLimiterProperties properties;
